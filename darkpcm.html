@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>DARKPCM</title>
+
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="index.css">
+  <script src="darkpcm.js"></script>
+</head>
+<body>
+  <div class="wrap">
+
+    <div class="topButtons">
+      <label class="btn" for="fileInput">Upload</label>
+      <button class="btn" id="downloadBtn" disabled>Download</button>
+    </div>
+
+    <div class="title">DARKPCM</div>
+
+    
+    <div class="box waveBox">
+      <div class="row between">
+        <div class="file">
+          <div class="filePick">
+            <span class="label">Loaded:</span>
+            <span class="pill" id="fileName">none</span>
+          </div>
+        </div>
+
+        <div class="controlGroup">
+          <button class="btn" id="playBtn" disabled>Play</button>
+          <button class="btn" id="pauseBtn" disabled>Pause</button>
+        </div>
+      </div>
+
+      <div style="height:12px"></div>
+
+      <div class="canvasShell" aria-label="waveform">
+        <canvas id="wave"></canvas>
+      </div>
+
+      <div class="status" id="status">Upload a WAV or DPCM/DMC file.</div>
+    </div>
+
+   
+    <div class="box">
+      <div class="controls">
+
+        <div class="controlGroup">
+          <button class="btn" id="wavToDpcmBtn" disabled>WAV → DPCM</button>
+          <button class="btn" id="dpcmToWavBtn" disabled>DPCM → WAV</button>
+
+          <div class="small" style="max-width:420px">
+            WAV→DPCM encodes the WAV into a standard NES DPCM (1 bit, fixed step size).
+            DPCM→WAV reconstructs back to WAV file, back to back.
+          </div>
+        </div>
+
+        <div class="slider">
+          <span class="label">Volume</span>
+          <input id="vol" type="range" min="0" max="1" value="0.9" step="0.01" disabled />
+          <span class="label" id="volText">90%</span>
+        </div>
+
+      </div><br><br><br>
+      <div class="card">
+    <div class="socials">
+  <a class="social-btn" href="http://discordapp.com/users/879525807045894204" target="_blank" rel="noopener">
+    <img src="discord.png" alt="Discord">
+  </a>
+
+  <a class="social-btn" href="https://www.youtube.com/@darkcs69" target="_blank" rel="noopener">
+    <img src="yt.png" alt="YouTube">
+  </a>
+</div>
+
+      <div style="height:10px"></div>
+
+    <input id="fileInput" type="file" accept=".wav,.dmc,.dpcm,audio/wav,audio/x-wav,application/octet-stream" />
+
+  </div>
+
+
+<!--script-->
+<!--credit: trirosmos for original dpcm convertor (d[aw]pcm)-->
+
+
+<script>
+(() => {
+
+  const fileInput = document.getElementById('fileInput');
+  const fileNameEl = document.getElementById('fileName');
+  const statusEl   = document.getElementById('status');
+
+  const playBtn    = document.getElementById('playBtn');
+  const pauseBtn   = document.getElementById('pauseBtn');
+  const downloadBtn= document.getElementById('downloadBtn');
+
+  const wavToDpcmBtn = document.getElementById('wavToDpcmBtn');
+  const dpcmToWavBtn = document.getElementById('dpcmToWavBtn');
+
+  const volEl      = document.getElementById('vol');
+  const volTextEl  = document.getElementById('volText');
+
+  const canvas     = document.getElementById('wave');
+  const cctx       = canvas.getContext('2d');
+
+  // audio state
+  let audioCtx = null;
+  let gainNode = null;
+  let sourceNode = null; 
+
+  const current = {
+    mode: null,
+    wav: { buffer: null, mono: null, sampleRate: null },
+    dpcm:{ bytes: null, samples: null, sampleRate: null, sampleTime: null, isNTSC: true, periodIndex: 15 },
+    // playback
+    durationSec: 0,
+    playing: false,
+    startCtxTime: 0,
+    pauseOffset: 0, // playback (sec)
+  };
+
+  // download payload set by conversion
+  let downloadPayload = null;
+
+  // playhead and seeking
+  let rafId = null;
+  let isSeeking = false;
+
+ 
+  const DEFAULT_IS_NTSC = true;
+  const DEFAULT_PERIOD_INDEX = 15;
+
+ 
+  function setStatus(t){ statusEl.textContent = t; }
+  function setFileName(t){ fileNameEl.textContent = t; }
+
+  function ensureAudio(){
+    if (!audioCtx){
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = Number(volEl.value || 0.9);
+      gainNode.connect(audioCtx.destination);
+    }
+  }
+
+  function stopRaf(){
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+  function mixToMono(ab){
+    const len = ab.length;
+    const out = new Float32Array(len);
+    const ch = ab.numberOfChannels;
+    for (let c=0;c<ch;c++){
+      const d = ab.getChannelData(c);
+      for (let i=0;i<len;i++) out[i] += d[i] / ch;
+    }
+    return out;
+  }
+
+  // nes dmc timing (according to nesdev)
+  const NTSCPeriods = [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54];
+  const PALPeriods  = [398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50];
+
+  function getSampleTimeSec(isNTSC, periodIndex){
+    const p = isNTSC ? NTSCPeriods[periodIndex] : PALPeriods[periodIndex];
+    const cpu = isNTSC ? 1789773 : 1662607;
+    return 1 / (cpu / p);
+  }
+
+  // wav float samples n sample rates
+  function wavToDpcmHardwareish(floatSamples, wavSampleRate, isNTSC, periodIndex){
+    const sampleTime = getSampleTimeSec(isNTSC, periodIndex);
+
+    let dCounter = 64; 
+    let deltaT = 0;
+
+    let bit = 0;
+    let byte = 0;
+    const dmcData = [0];
+
+    for (let x = 0; x < floatSamples.length; x++){
+      deltaT += 1 / wavSampleRate;
+
+      while (deltaT >= sampleTime){
+        deltaT -= sampleTime;
+
+        const thresh = (dCounter / 64) - 1; 
+        if (floatSamples[x] > thresh){
+          dmcData[byte] |= (1 << bit);
+          dCounter += 2;
+        } else {
+          dCounter -= 2;
+        }
+
+        if (dCounter < 0) dCounter = 0;
+        if (dCounter > 127) dCounter = 127;
+
+        bit++;
+        if (bit > 7){
+          bit = 0;
+          byte++;
+          dmcData.push(0);
+        }
+      }
+    }
+
+    return { bytes: new Uint8Array(dmcData), sampleTime };
+  }
+
+  // dmc bytes n sample time to float samples at output sample rate (ex. 44100)
+  function dpcmToFloatAudioHardwareish(dpcmBytes, sampleTime, outputSampleRate){
+    let deltaT = 0;
+    let dCounter = 0;
+    let bit = 0;
+    let byte = 0;
+
+    const soundData = [];
+    const totalBits = dpcmBytes.length * 8;
+
+    for (let x = 0; x < totalBits; x++){
+      deltaT += sampleTime;
+
+      if (dpcmBytes[byte] & (1 << bit)) dCounter += (2/64);
+      else dCounter -= (2/64);
+
+      if (dCounter < -1) dCounter = -1;
+      if (dCounter > 1)  dCounter = 1;
+
+      while (deltaT > 1 / outputSampleRate){
+        deltaT -= 1 / outputSampleRate;
+        soundData.push(dCounter);
+      }
+
+      bit++;
+      if (bit > 7){
+        bit = 0;
+        byte++;
+        if (byte >= dpcmBytes.length) break;
+      }
+    }
+
+    return new Float32Array(soundData);
+  }
+
+  // wav export (16 bit unsigned pcm, mono)
+  function floatTo16PCM(f){
+    const v = Math.max(-1, Math.min(1, f));
+    return v < 0 ? (v * 32768) : (v * 32767);
+  }
+
+  function writeWavMono16(samples, sampleRate){
+    const dataSize = samples.length * 2;
+    const buf = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buf);
+
+    function wstr(off, s){ for(let i=0;i<s.length;i++) view.setUint8(off+i, s.charCodeAt(i)); }
+
+    wstr(0,"RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    wstr(8,"WAVE");
+    wstr(12,"fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    wstr(36,"data");
+    view.setUint32(40, dataSize, true);
+
+    let o = 44;
+    for(let i=0;i<samples.length;i++){
+      view.setInt16(o, floatTo16PCM(samples[i]), true);
+      o += 2;
+    }
+    return new Blob([buf], {type:"audio/wav"});
+  }
+
+  // resizing
+  function resizeCanvas(){
+    const dpr = devicePixelRatio || 1;
+    const w = Math.floor(canvas.clientWidth * dpr);
+    const h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h){
+      canvas.width = Math.max(1, w);
+      canvas.height = Math.max(1, h);
+    }
+  }
+
+  function getDisplayedSamples(){
+    if (current.mode === "wav") return current.wav.mono;
+    if (current.mode === "dpcm") return current.dpcm.samples;
+    return null;
+  }
+
+  function getDisplayedRate(){
+    if (current.mode === "wav") return current.wav.sampleRate;
+    if (current.mode === "dpcm") return current.dpcm.sampleRate;
+    return null;
+  }
+
+  function drawWaveWithPlayhead(){
+    resizeCanvas();
+    const w = canvas.width, h = canvas.height;
+
+    // bg
+    cctx.clearRect(0,0,w,h);
+    cctx.fillStyle = "rgba(0,0,0,0.10)";
+    cctx.fillRect(0,0,w,h);
+
+    // base
+    cctx.strokeStyle = "rgba(255,152,0,0.25)";
+    cctx.lineWidth = 1;
+    cctx.beginPath();
+    cctx.moveTo(0, h/2);
+    cctx.lineTo(w, h/2);
+    cctx.stroke();
+
+    const samples = getDisplayedSamples();
+    if (samples && samples.length > 1){
+      cctx.strokeStyle = "rgba(255,152,0,0.95)";
+      cctx.lineWidth = 1;
+
+      const step = Math.ceil(samples.length / w);
+      for(let x=0; x<w; x++){
+        const i0 = x * step;
+        let mn = 1, mx = -1;
+        for(let k=0;k<step;k++){
+          const i = i0 + k;
+          if(i >= samples.length) break;
+          const v = samples[i];
+          if(v < mn) mn = v;
+          if(v > mx) mx = v;
+        }
+        const y1 = (1 - (mx + 1) / 2) * h;
+        const y2 = (1 - (mn + 1) / 2) * h;
+        cctx.beginPath();
+        cctx.moveTo(x + 0.5, y1);
+        cctx.lineTo(x + 0.5, y2);
+        cctx.stroke();
+      }
+    }
+
+    // playhead line
+    if (current.durationSec > 0){
+      const t = clamp(getCurrentTimeSec(), 0, current.durationSec);
+      const x = (t / current.durationSec) * w;
+
+      cctx.strokeStyle = "rgba(255,152,0,0.9)";
+      cctx.lineWidth = 2;
+      cctx.beginPath();
+      cctx.moveTo(x, 0);
+      cctx.lineTo(x, h);
+      cctx.stroke();
+
+      // small glow
+      cctx.strokeStyle = "rgba(255,152,0,0.25)";
+      cctx.lineWidth = 6;
+      cctx.beginPath();
+      cctx.moveTo(x, 0);
+      cctx.lineTo(x, h);
+      cctx.stroke();
+    }
+  }
+
+  // timing playback based on AudioContext time, with pauseOffset to keep track of where we are in the audio when pausing/seeking
+  function getCurrentTimeSec(){
+    if (!current.playing) return current.pauseOffset;
+    if (!audioCtx) return current.pauseOffset;
+    return current.pauseOffset + (audioCtx.currentTime - current.startCtxTime);
+  }
+
+  function updateDuration(){
+    const rate = getDisplayedRate();
+    const samples = getDisplayedSamples();
+    if (rate && samples) current.durationSec = samples.length / rate;
+    else current.durationSec = 0;
+    current.pauseOffset = clamp(current.pauseOffset, 0, current.durationSec || 0);
+  }
+
+  function rebuildAudioBufferForPlayback(){
+    ensureAudio();
+    const samples = getDisplayedSamples();
+    const rate = getDisplayedRate();
+    if (!samples || !rate) return null;
+
+    const ab = audioCtx.createBuffer(1, samples.length, rate);
+    ab.getChannelData(0).set(samples);
+    return ab;
+  }
+
+  function stopSourceNode(){
+    try{
+      if (sourceNode){
+        sourceNode.onended = null;
+        sourceNode.stop();
+        sourceNode.disconnect();
+      }
+    }catch(_){}
+    sourceNode = null;
+  }
+
+  function startPlayback(fromSec){
+    const ab = rebuildAudioBufferForPlayback();
+    if (!ab) return;
+
+    stopSourceNode();
+
+    const offset = clamp(fromSec, 0, ab.duration);
+
+    sourceNode = audioCtx.createBufferSource();
+    sourceNode.buffer = ab;
+    sourceNode.connect(gainNode);
+
+    current.playing = true;
+    current.startCtxTime = audioCtx.currentTime;
+    current.pauseOffset = offset;
+
+    sourceNode.onended = () => {
+      if (current.playing){
+        current.playing = false;
+        current.pauseOffset = current.durationSec;
+        stopRaf();
+        drawWaveWithPlayhead();
+      }
+    };
+
+    sourceNode.start(0, offset);
+
+    const tick = () => {
+      if (!current.playing) return;
+      drawWaveWithPlayhead();
+      rafId = requestAnimationFrame(tick);
+    };
+    stopRaf();
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function pausePlayback(){
+    if (!current.playing) return;
+    current.pauseOffset = clamp(getCurrentTimeSec(), 0, current.durationSec);
+    current.playing = false;
+    stopSourceNode();
+    stopRaf();
+    drawWaveWithPlayhead();
+  }
+
+  function seekTo(sec){
+    sec = clamp(sec, 0, current.durationSec);
+    current.pauseOffset = sec;
+
+    if (current.playing){
+      startPlayback(sec);
+    } else {
+      drawWaveWithPlayhead();
+    }
+  }
+
+  // set current mode (wav or dpcm), which determines what is drawn in the waveform and what is played back when hitting play. fuck you copilot
+  function setMode(mode){
+    current.mode = mode;
+    updateDuration();
+    drawWaveWithPlayhead();
+  }
+
+  function setDownload(blob, name){
+    downloadPayload = blob ? {blob, name} : null;
+    downloadBtn.disabled = !downloadPayload;
+  }
+
+  function enableMainUI(on){
+    playBtn.disabled = !on;
+    pauseBtn.disabled = !on;
+    wavToDpcmBtn.disabled = !on;
+    dpcmToWavBtn.disabled = !on;
+    volEl.disabled = !on;
+  }
+
+  // click/drag setting
+  function canvasXToTime(clientX){
+    const rect = canvas.getBoundingClientRect();
+    const x = clamp(clientX - rect.left, 0, rect.width);
+    if (current.durationSec <= 0) return 0;
+    return (x / rect.width) * current.durationSec;
+  }
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (current.durationSec <= 0) return;
+    isSeeking = true;
+    seekTo(canvasXToTime(e.clientX));
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!isSeeking) return;
+    seekTo(canvasXToTime(e.clientX));
+  });
+  window.addEventListener('mouseup', () => { isSeeking = false; });
+  canvas.addEventListener('click', (e) => {
+    if (current.durationSec <= 0) return;
+    seekTo(canvasXToTime(e.clientX));
+  });
+
+  // ui events
+  volEl.addEventListener('input', () => {
+    const pct = Math.round(Number(volEl.value) * 100);
+    volTextEl.textContent = pct + "%";
+    if (gainNode) gainNode.gain.value = Number(volEl.value);
+  });
+
+  playBtn.addEventListener('click', () => {
+    if (!current.mode) return;
+    ensureAudio();
+    startPlayback(current.pauseOffset);
+  });
+
+  pauseBtn.addEventListener('click', () => pausePlayback());
+
+  // download button (for downloading converted DPCM or WAV)
+  downloadBtn.addEventListener('click', () => {
+    if (!downloadPayload) return;
+    const url = URL.createObjectURL(downloadPayload.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadPayload.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  // load accepted files
+  fileInput.addEventListener('change', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+
+    pausePlayback();
+    setDownload(null, "");
+    enableMainUI(false);
+
+    setFileName(f.name);
+    setStatus("Loading...");
+
+    const ext = (f.name.split('.').pop() || "").toLowerCase();
+    const isWav = (ext === "wav") || (f.type && f.type.includes("wav"));
+    const isDpcm = (ext === "dmc" || ext === "dpcm") || (!isWav);
+
+    try{
+      if (isWav){
+        ensureAudio();
+        const arr = await f.arrayBuffer();
+        const ab = await audioCtx.decodeAudioData(arr.slice(0));
+
+        current.wav.buffer = ab;
+        current.wav.sampleRate = ab.sampleRate;
+        current.wav.mono = mixToMono(ab);
+
+        current.dpcm.bytes = null;
+        current.dpcm.samples = null;
+        current.dpcm.sampleRate = null;
+        current.dpcm.sampleTime = null;
+
+        current.pauseOffset = 0;
+        setMode("wav");
+
+        enableMainUI(true);
+        setStatus(`Loaded WAV • ${ab.sampleRate} Hz • ${ab.duration.toFixed(2)} s`);
+      } else if (isDpcm){
+        const arr = await f.arrayBuffer();
+        const bytes = new Uint8Array(arr);
+
+        ensureAudio();
+        const isNTSC = DEFAULT_IS_NTSC;
+        const periodIndex = DEFAULT_PERIOD_INDEX;
+        const sampleTime = getSampleTimeSec(isNTSC, periodIndex);
+
+        const outputRate = audioCtx.sampleRate;
+        const samples = dpcmToFloatAudioHardwareish(bytes, sampleTime, outputRate);
+
+        current.dpcm.bytes = bytes;
+        current.dpcm.samples = samples;
+        current.dpcm.sampleRate = outputRate;
+        current.dpcm.sampleTime = sampleTime;
+        current.dpcm.isNTSC = isNTSC;
+        current.dpcm.periodIndex = periodIndex;
+
+        // clear wav slot
+        current.wav.buffer = null;
+        current.wav.mono = null;
+        current.wav.sampleRate = null;
+
+        current.pauseOffset = 0;
+        setMode("dpcm");
+
+        enableMainUI(true);
+        setStatus(`Loaded DPCM • ${bytes.length} bytes • NTSC period ${periodIndex} • preview @ ${outputRate} Hz`);
+      } else {
+        setStatus("Unknown file type. Use .wav, .dmc, or .dpcm");
+      }
+    }catch(err){
+      console.error(err);
+      setStatus("Failed to load file: " + err);
+    }
+  });
+
+  // wav to dpcm encoding (dawpcm sourced)
+  wavToDpcmBtn.addEventListener('click', () => {
+    if (current.mode !== "wav" || !current.wav.mono) {
+      setStatus("Load a WAV first.");
+      return;
+    }
+
+    pausePlayback();
+    ensureAudio();
+
+    const isNTSC = DEFAULT_IS_NTSC;
+    const periodIndex = DEFAULT_PERIOD_INDEX;
+
+    const enc = wavToDpcmHardwareish(current.wav.mono, current.wav.sampleRate, isNTSC, periodIndex);
+
+    const outputRate = audioCtx.sampleRate;
+    const recon = dpcmToFloatAudioHardwareish(enc.bytes, enc.sampleTime, outputRate);
+
+    current.dpcm.bytes = enc.bytes;
+    current.dpcm.samples = recon;
+    current.dpcm.sampleRate = outputRate;
+    current.dpcm.sampleTime = enc.sampleTime;
+    current.dpcm.isNTSC = isNTSC;
+    current.dpcm.periodIndex = periodIndex;
+
+    current.pauseOffset = 0;
+    setMode("dpcm");
+
+    const base = (fileNameEl.textContent || "sample").replace(/\.[^/.]+$/, "");
+    setDownload(new Blob([enc.bytes], {type:"application/octet-stream"}), base + ".dmc");
+
+    setStatus(`Converted WAV → DPCM • ${enc.bytes.length} bytes • NTSC period ${periodIndex} (now viewing DPCM waveform)`);
+  });
+
+  // dpcm to wav (back to back)
+  dpcmToWavBtn.addEventListener('click', () => {
+    if (current.mode !== "dpcm" || !current.dpcm.bytes) {
+      setStatus("Load a DPCM first (or convert WAV → DPCM).");
+      return;
+    }
+
+    pausePlayback();
+    ensureAudio();
+
+    const outputRate = audioCtx.sampleRate;
+    const sampleTime = current.dpcm.sampleTime || getSampleTimeSec(DEFAULT_IS_NTSC, DEFAULT_PERIOD_INDEX);
+
+    const samples = dpcmToFloatAudioHardwareish(current.dpcm.bytes, sampleTime, outputRate);
+
+    current.wav.mono = samples;
+    current.wav.sampleRate = outputRate;
+    current.wav.buffer = null;
+
+    current.pauseOffset = 0;
+    setMode("wav");
+
+    const wavBlob = writeWavMono16(samples, outputRate);
+    const base = (fileNameEl.textContent || "sample").replace(/\.[^/.]+$/, "");
+    setDownload(wavBlob, base + ".wav");
+
+    setStatus(`Converted DPCM → WAV • now viewing WAV waveform`);
+  });
+
+  // redraw on resize (prevents playhead fuckup)
+  window.addEventListener('resize', () => drawWaveWithPlayhead());
+
+  // initial
+  volTextEl.textContent = Math.round(Number(volEl.value || 0.9) * 100) + "%";
+  enableMainUI(false);
+  setDownload(null,"");
+  setMode(null);
+  setFileName("none");
+  setStatus("Upload a WAV or DPCM/DMC file.");
+})();
+</script>
+</body>
+</html>
